@@ -4,8 +4,10 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\AuditLog;
+use App\Models\TenantSetting;
 use App\Models\TrustedDevice;
 use App\Models\User;
+use App\Services\Auth\AdLdapService;
 use App\Services\Auth\JwtService;
 use App\Services\Auth\MailOtpService;
 use App\Services\Auth\TokenRevocationService;
@@ -26,6 +28,7 @@ class AuthController extends Controller
         private readonly TokenRevocationService $tokenRevocationService,
         private readonly MailOtpService $mailOtpService,
         private readonly TotpService $totpService,
+        private readonly AdLdapService $adLdapService,
     ) {
     }
 
@@ -46,8 +49,8 @@ class AuthController extends Controller
             ], 429);
         }
 
-        $user = User::query()->where('email', Str::lower($payload['email']))->first();
-        if ($user === null || !Hash::check($payload['password'], (string) $user->password)) {
+        $user = $this->authenticateUser((string) $payload['email'], (string) $payload['password']);
+        if ($user === null) {
             RateLimiter::hit($rateLimitKey, 60);
             $this->audit(null, 'auth.login.failed', ['email' => $payload['email']]);
 
@@ -286,6 +289,109 @@ class AuthController extends Controller
             'action' => $action,
             'meta_json' => $meta,
         ]);
+    }
+
+    private function authenticateUser(string $email, string $password): ?User
+    {
+        $provider = $this->authProvider();
+        $allowLocalFallback = $this->authAllowLocalFallback();
+
+        if ($provider === 'ad_ldap') {
+            $adUser = null;
+            try {
+                $adUser = $this->adLdapService->authenticate($this->adLdapConfig(), $email, $password);
+            } catch (Throwable) {
+                $adUser = null;
+            }
+
+            if (is_array($adUser)) {
+                return $this->upsertAdUser($adUser);
+            }
+
+            if (!$allowLocalFallback) {
+                return null;
+            }
+        }
+
+        $user = User::query()
+            ->where('email', Str::lower($email))
+            ->where('is_active', true)
+            ->first();
+        if ($user === null || !Hash::check($password, (string) $user->password)) {
+            return null;
+        }
+
+        return $user;
+    }
+
+    /**
+     * @param array<string, mixed> $adUser
+     */
+    private function upsertAdUser(array $adUser): User
+    {
+        $email = Str::lower(trim((string) ($adUser['email'] ?? '')));
+        $externalId = trim((string) ($adUser['external_id'] ?? ''));
+
+        $user = null;
+        if ($externalId !== '') {
+            $user = User::query()
+                ->where('auth_provider', 'ad_ldap')
+                ->where('external_directory_id', $externalId)
+                ->first();
+        }
+        if ($user === null && $email !== '') {
+            $user = User::query()->where('email', $email)->first();
+        }
+
+        if ($user === null) {
+            $user = new User();
+            $user->password = Hash::make(Str::random(48));
+            $user->mfa_type = 'mail';
+            $user->must_change_password = false;
+        }
+
+        if ($email !== '') {
+            $user->email = $email;
+        }
+        $user->first_name = trim((string) ($adUser['first_name'] ?? '')) ?: ($user->first_name ?: 'AD');
+        $user->last_name = trim((string) ($adUser['last_name'] ?? '')) ?: ($user->last_name ?: 'User');
+        $user->auth_provider = 'ad_ldap';
+        $user->ad_username = trim((string) ($adUser['username'] ?? '')) ?: $user->ad_username;
+        $user->external_directory_id = $externalId !== '' ? $externalId : $user->external_directory_id;
+        $user->external_directory_dn = trim((string) ($adUser['dn'] ?? '')) ?: $user->external_directory_dn;
+        $user->external_directory_active = true;
+        $user->external_directory_last_sync_at = now();
+        $user->is_active = true;
+        $user->disabled_at = null;
+        $user->save();
+
+        return $user;
+    }
+
+    private function authProvider(): string
+    {
+        $provider = TenantSetting::query()->where('key', 'auth_provider')->value('value_json');
+        $provider = is_string($provider) ? trim($provider) : 'local';
+        return in_array($provider, ['local', 'ad_ldap'], true) ? $provider : 'local';
+    }
+
+    private function authAllowLocalFallback(): bool
+    {
+        $value = TenantSetting::query()->where('key', 'auth_allow_local_fallback')->value('value_json');
+        return $value === null ? true : (bool) $value;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function adLdapConfig(): array
+    {
+        $config = TenantSetting::query()->where('key', 'ad_ldap_config')->value('value_json');
+        if (!is_array($config)) {
+            return ['enabled' => false];
+        }
+
+        return $config;
     }
 
     private function resolveTrustedDevice(Request $request, User $user): ?TrustedDevice

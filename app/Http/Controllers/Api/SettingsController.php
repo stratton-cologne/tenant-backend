@@ -2,13 +2,16 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Jobs\ProcessLdapDeactivationJob;
 use App\Http\Controllers\Controller;
 use App\Mail\SettingsTestMail;
 use App\Models\AuditLog;
 use App\Models\ModuleEntitlement;
+use App\Models\Role;
 use App\Models\TenantSetting;
 use App\Models\UserModuleEntitlement;
 use App\Models\User;
+use App\Services\Auth\AdLdapService;
 use App\Services\Licensing\ModuleSeatService;
 use App\Services\CoreModuleUsageSyncService;
 use App\Services\CoreLicenseSyncService;
@@ -24,10 +27,17 @@ use Throwable;
 
 class SettingsController extends Controller
 {
+    private const LDAP_DEACTIVATE_STRATEGIES = [
+        'disable_all_ad_users',
+        'convert_all_to_local',
+        'convert_selected_to_local_and_disable_rest',
+    ];
+
     public function __construct(
         private readonly CoreLicenseSyncService $coreLicenseSyncService,
         private readonly CoreModuleUsageSyncService $coreModuleUsageSyncService,
         private readonly ModuleSeatService $moduleSeatService,
+        private readonly AdLdapService $adLdapService,
     )
     {
     }
@@ -48,6 +58,7 @@ class SettingsController extends Controller
                 'dashboard_allowed_widgets_configured' => $this->settingExists('dashboard_allowed_widgets'),
                 'license_api_url' => $this->stringSetting('license_api_url', (string) config('app.url')),
                 'core_tenant_uuid' => $this->stringSetting('core_tenant_uuid', ''),
+                'auth' => $this->authSettingsPayload(),
                 'contact' => $this->setting('contact', ['email' => '', 'phone' => '']),
                 'mail' => [
                     'from_name' => $mail['from_name'] ?? (string) config('mail.from.name', 'Tenant'),
@@ -77,6 +88,29 @@ class SettingsController extends Controller
             'dashboard_allowed_widgets.*' => ['string', 'max:120'],
             'license_api_url' => ['nullable', 'url'],
             'core_tenant_uuid' => ['nullable', 'uuid'],
+            'auth' => ['nullable', 'array'],
+            'auth.provider' => ['nullable', 'in:local,ad_ldap'],
+            'auth.allow_local_fallback' => ['nullable', 'boolean'],
+            'auth.ad_ldap' => ['nullable', 'array'],
+            'auth.ad_ldap.enabled' => ['nullable', 'boolean'],
+            'auth.ad_ldap.host' => ['nullable', 'string', 'max:255'],
+            'auth.ad_ldap.port' => ['nullable', 'integer', 'min:1', 'max:65535'],
+            'auth.ad_ldap.base_dn' => ['nullable', 'string', 'max:255'],
+            'auth.ad_ldap.bind_dn' => ['nullable', 'string', 'max:255'],
+            'auth.ad_ldap.bind_password' => ['nullable', 'string', 'max:255'],
+            'auth.ad_ldap.user_filter' => ['nullable', 'string', 'max:500'],
+            'auth.ad_ldap.sync_filter' => ['nullable', 'string', 'max:500'],
+            'auth.ad_ldap.username_attribute' => ['nullable', 'string', 'max:120'],
+            'auth.ad_ldap.email_attribute' => ['nullable', 'string', 'max:120'],
+            'auth.ad_ldap.first_name_attribute' => ['nullable', 'string', 'max:120'],
+            'auth.ad_ldap.last_name_attribute' => ['nullable', 'string', 'max:120'],
+            'auth.ad_ldap.group_attribute' => ['nullable', 'string', 'max:120'],
+            'auth.ad_ldap.use_ssl' => ['nullable', 'boolean'],
+            'auth.ad_ldap.use_tls' => ['nullable', 'boolean'],
+            'auth.ad_ldap.timeout' => ['nullable', 'integer', 'min:1', 'max:30'],
+            'auth.ad_ldap.group_role_map' => ['nullable', 'array', 'max:200'],
+            'auth.ad_ldap.group_role_map.*.group' => ['required_with:auth.ad_ldap.group_role_map', 'string', 'max:500'],
+            'auth.ad_ldap.group_role_map.*.role_uuid' => ['required_with:auth.ad_ldap.group_role_map', 'uuid'],
             'contact' => ['nullable', 'array'],
             'mail' => ['nullable', 'array'],
             'mail.from_name' => ['nullable', 'string', 'max:120'],
@@ -109,7 +143,52 @@ class SettingsController extends Controller
             $payload['mail'] = array_merge($currentMail, $incomingMail);
         }
 
+        if (isset($payload['auth']) && is_array($payload['auth'])) {
+            $currentProvider = $this->stringSetting('auth_provider', 'local');
+            $provider = isset($payload['auth']['provider']) && is_string($payload['auth']['provider'])
+                ? (string) $payload['auth']['provider']
+                : $currentProvider;
+            $allowLocalFallback = (bool) ($payload['auth']['allow_local_fallback'] ?? $this->setting('auth_allow_local_fallback', true));
+
+            $currentLdap = $this->setting('ad_ldap_config', []);
+            if (!is_array($currentLdap)) {
+                $currentLdap = [];
+            }
+            $incomingLdap = isset($payload['auth']['ad_ldap']) && is_array($payload['auth']['ad_ldap'])
+                ? $payload['auth']['ad_ldap']
+                : [];
+            if (array_key_exists('bind_password', $incomingLdap) && trim((string) $incomingLdap['bind_password']) === '') {
+                unset($incomingLdap['bind_password']);
+            }
+            $ldapConfig = array_merge($currentLdap, $incomingLdap);
+
+            TenantSetting::query()->updateOrCreate(['key' => 'auth_provider'], ['value_json' => $provider]);
+            TenantSetting::query()->updateOrCreate(['key' => 'auth_allow_local_fallback'], ['value_json' => $allowLocalFallback]);
+            TenantSetting::query()->updateOrCreate(['key' => 'ad_ldap_config'], ['value_json' => $ldapConfig]);
+
+            if (isset($incomingLdap['group_role_map']) && is_array($incomingLdap['group_role_map'])) {
+                $groupRoleMap = array_values(array_filter(array_map(
+                    static function (mixed $row): ?array {
+                        if (!is_array($row)) {
+                            return null;
+                        }
+                        $group = trim((string) ($row['group'] ?? ''));
+                        $roleUuid = trim((string) ($row['role_uuid'] ?? ''));
+                        if ($group === '' || $roleUuid === '') {
+                            return null;
+                        }
+                        return ['group' => $group, 'role_uuid' => $roleUuid];
+                    },
+                    $incomingLdap['group_role_map']
+                )));
+                TenantSetting::query()->updateOrCreate(['key' => 'ad_ldap_group_role_map'], ['value_json' => $groupRoleMap]);
+            }
+        }
+
         foreach ($payload as $key => $value) {
+            if ($key === 'auth') {
+                continue;
+            }
             if ($key === 'dashboard_allowed_widgets' && is_array($value)) {
                 $value = array_values(array_unique(array_filter(
                     array_map(static fn (mixed $entry): string => trim((string) $entry), $value),
@@ -153,6 +232,144 @@ class SettingsController extends Controller
             'status' => 'sent',
             'to' => $to,
         ]);
+    }
+
+    public function testLdap(Request $request): JsonResponse
+    {
+        $payload = $request->validate([
+            'config' => ['nullable', 'array'],
+        ]);
+
+        $config = $this->resolveLdapConfig(isset($payload['config']) && is_array($payload['config']) ? $payload['config'] : null);
+
+        try {
+            $this->adLdapService->testConnection($config);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => 'LDAP connection test failed',
+                'error' => $exception->getMessage(),
+            ], 422);
+        }
+
+        $this->audit((string) $request->attributes->get('auth.user_uuid'), 'settings.auth.ldap.tested');
+
+        return response()->json(['status' => 'ok']);
+    }
+
+    public function syncLdap(Request $request): JsonResponse
+    {
+        try {
+            $stats = $this->adLdapService->sync($this->resolveLdapConfig());
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => 'LDAP sync failed',
+                'error' => $exception->getMessage(),
+            ], 422);
+        }
+
+        $this->audit((string) $request->attributes->get('auth.user_uuid'), 'settings.auth.ldap.synced', $stats);
+
+        return response()->json([
+            'status' => 'ok',
+            'stats' => $stats,
+            'synced_at' => now()->toISOString(),
+        ]);
+    }
+
+    public function ldapUsers(): JsonResponse
+    {
+        $users = User::query()
+            ->where('auth_provider', 'ad_ldap')
+            ->where('is_active', true)
+            ->orderBy('first_name')
+            ->orderBy('last_name')
+            ->get(['uuid', 'first_name', 'last_name', 'email', 'ad_username', 'external_directory_active'])
+            ->map(static fn (User $user): array => [
+                'uuid' => (string) $user->uuid,
+                'first_name' => (string) $user->first_name,
+                'last_name' => (string) $user->last_name,
+                'name' => trim(((string) $user->first_name).' '.((string) $user->last_name)),
+                'email' => (string) $user->email,
+                'ad_username' => $user->ad_username,
+                'external_directory_active' => (bool) $user->external_directory_active,
+            ])
+            ->values()
+            ->all();
+
+        return response()->json([
+            'data' => $users,
+            'total' => count($users),
+        ]);
+    }
+
+    public function deactivateLdap(Request $request): JsonResponse
+    {
+        $payload = $request->validate([
+            'strategy' => ['required', 'string', 'in:'.implode(',', self::LDAP_DEACTIVATE_STRATEGIES)],
+            'selected_user_uuids' => ['nullable', 'array'],
+            'selected_user_uuids.*' => ['uuid'],
+            'temp_password_valid_days' => ['nullable', 'integer', 'in:1,3,7'],
+        ]);
+
+        $strategy = (string) $payload['strategy'];
+        $selectedUserUuids = array_values(array_unique(array_filter(array_map(
+            static fn (mixed $uuid): string => trim((string) $uuid),
+            (array) ($payload['selected_user_uuids'] ?? [])
+        ))));
+        $validDays = (int) ($payload['temp_password_valid_days'] ?? 7);
+
+        if ($strategy === 'convert_selected_to_local_and_disable_rest' && $selectedUserUuids === []) {
+            return response()->json([
+                'message' => 'Please select at least one AD user for local conversion',
+            ], 422);
+        }
+
+        $operationId = (string) \Illuminate\Support\Str::uuid();
+        TenantSetting::query()->updateOrCreate(
+            ['key' => 'ldap_deactivation_operation:'.$operationId],
+            ['value_json' => [
+                'operation_id' => $operationId,
+                'status' => 'queued',
+                'strategy' => $strategy,
+                'selected_user_uuids' => $selectedUserUuids,
+                'temp_password_valid_days' => $validDays,
+                'actor_user_uuid' => (string) $request->attributes->get('auth.user_uuid'),
+                'updated_at' => now()->toISOString(),
+                'meta' => [],
+            ]]
+        );
+
+        ProcessLdapDeactivationJob::dispatch(
+            operationId: $operationId,
+            strategy: $strategy,
+            selectedUserUuids: $selectedUserUuids,
+            tempPasswordValidDays: $validDays,
+            actorUserUuid: (string) $request->attributes->get('auth.user_uuid'),
+        );
+
+        $this->audit((string) $request->attributes->get('auth.user_uuid'), 'settings.auth.ldap.deactivation.queued', [
+            'strategy' => $strategy,
+            'operation_id' => $operationId,
+        ]);
+
+        return response()->json([
+            'status' => 'queued',
+            'operation_id' => $operationId,
+            'strategy' => $strategy,
+        ], 202);
+    }
+
+    public function ldapDeactivationStatus(string $operationId): JsonResponse
+    {
+        $value = TenantSetting::query()
+            ->where('key', 'ldap_deactivation_operation:'.trim($operationId))
+            ->value('value_json');
+
+        if (!is_array($value)) {
+            return response()->json(['message' => 'Operation not found'], 404);
+        }
+
+        return response()->json(['data' => $value]);
     }
 
     public function getLicenses(): JsonResponse
@@ -471,6 +688,90 @@ class SettingsController extends Controller
             array_map(static fn (mixed $entry): string => trim((string) $entry), $value),
             static fn (string $entry): bool => $entry !== ''
         )));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function authSettingsPayload(): array
+    {
+        $provider = $this->stringSetting('auth_provider', 'local');
+        $allowLocalFallback = (bool) $this->setting('auth_allow_local_fallback', true);
+        $config = $this->setting('ad_ldap_config', []);
+        if (!is_array($config)) {
+            $config = [];
+        }
+        $groupRoleMap = $this->setting('ad_ldap_group_role_map', []);
+        if (!is_array($groupRoleMap)) {
+            $groupRoleMap = [];
+        }
+        $lastSync = $this->setting('ad_ldap_last_sync', null);
+
+        return [
+            'provider' => in_array($provider, ['local', 'ad_ldap'], true) ? $provider : 'local',
+            'allow_local_fallback' => $allowLocalFallback,
+            'ad_ldap' => [
+                'enabled' => (bool) ($config['enabled'] ?? false),
+                'host' => (string) ($config['host'] ?? ''),
+                'port' => (int) ($config['port'] ?? 389),
+                'base_dn' => (string) ($config['base_dn'] ?? ''),
+                'bind_dn' => (string) ($config['bind_dn'] ?? ''),
+                'bind_password_set' => is_string($config['bind_password'] ?? null) && trim((string) $config['bind_password']) !== '',
+                'user_filter' => (string) ($config['user_filter'] ?? ''),
+                'sync_filter' => (string) ($config['sync_filter'] ?? ''),
+                'username_attribute' => (string) ($config['username_attribute'] ?? 'samaccountname'),
+                'email_attribute' => (string) ($config['email_attribute'] ?? 'mail'),
+                'first_name_attribute' => (string) ($config['first_name_attribute'] ?? 'givenname'),
+                'last_name_attribute' => (string) ($config['last_name_attribute'] ?? 'sn'),
+                'group_attribute' => (string) ($config['group_attribute'] ?? 'memberof'),
+                'use_ssl' => (bool) ($config['use_ssl'] ?? false),
+                'use_tls' => (bool) ($config['use_tls'] ?? false),
+                'timeout' => (int) ($config['timeout'] ?? 5),
+                'group_role_map' => $groupRoleMap,
+                'last_sync' => is_array($lastSync) ? $lastSync : null,
+                'available_roles' => Role::query()->orderBy('name')->get(['uuid', 'name'])->map(fn (Role $role): array => [
+                    'uuid' => (string) $role->uuid,
+                    'name' => (string) $role->name,
+                ])->all(),
+            ],
+        ];
+    }
+
+    /**
+     * @param array<string, mixed>|null $override
+     * @return array<string, mixed>
+     */
+    private function resolveLdapConfig(?array $override = null): array
+    {
+        $config = $this->setting('ad_ldap_config', []);
+        if (!is_array($config)) {
+            $config = [];
+        }
+        if (is_array($override) && $override !== []) {
+            if (array_key_exists('bind_password', $override) && trim((string) $override['bind_password']) === '') {
+                unset($override['bind_password']);
+            }
+            $config = array_merge($config, $override);
+        }
+
+        return [
+            'enabled' => (bool) ($config['enabled'] ?? false),
+            'host' => (string) ($config['host'] ?? ''),
+            'port' => (int) ($config['port'] ?? 389),
+            'base_dn' => (string) ($config['base_dn'] ?? ''),
+            'bind_dn' => (string) ($config['bind_dn'] ?? ''),
+            'bind_password' => (string) ($config['bind_password'] ?? ''),
+            'user_filter' => (string) ($config['user_filter'] ?? ''),
+            'sync_filter' => (string) ($config['sync_filter'] ?? ''),
+            'username_attribute' => (string) ($config['username_attribute'] ?? 'samaccountname'),
+            'email_attribute' => (string) ($config['email_attribute'] ?? 'mail'),
+            'first_name_attribute' => (string) ($config['first_name_attribute'] ?? 'givenname'),
+            'last_name_attribute' => (string) ($config['last_name_attribute'] ?? 'sn'),
+            'group_attribute' => (string) ($config['group_attribute'] ?? 'memberof'),
+            'use_ssl' => (bool) ($config['use_ssl'] ?? false),
+            'use_tls' => (bool) ($config['use_tls'] ?? false),
+            'timeout' => max(1, (int) ($config['timeout'] ?? 5)),
+        ];
     }
 
     private function performLicenseSync(?string $tenantUuid, ?string $actorUserUuid, string $trigger): JsonResponse

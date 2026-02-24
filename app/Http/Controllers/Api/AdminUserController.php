@@ -33,6 +33,7 @@ class AdminUserController extends Controller
     public function index(): JsonResponse
     {
         $users = User::query()
+            ->where('is_active', true)
             ->with(['roles', 'moduleEntitlements'])
             ->latest('created_at')
             ->get()
@@ -123,6 +124,7 @@ class AdminUserController extends Controller
     public function update(Request $request, User $user): JsonResponse
     {
         $beforeRoleNames = $user->roles()->pluck('name')->map(fn (mixed $name): string => (string) $name)->all();
+        $isDirectoryUser = (string) $user->auth_provider === 'ad_ldap';
 
         $payload = $request->validate([
             'first_name' => ['sometimes', 'string', 'max:120'],
@@ -136,6 +138,23 @@ class AdminUserController extends Controller
             'assigned_module_slugs' => ['sometimes', 'array'],
             'assigned_module_slugs.*' => ['string', 'max:120'],
         ]);
+
+        if ($isDirectoryUser) {
+            $hasIdentityPatch = array_key_exists('first_name', $payload)
+                || array_key_exists('last_name', $payload)
+                || array_key_exists('email', $payload);
+            if ($hasIdentityPatch) {
+                return response()->json([
+                    'message' => 'Directory managed users can not be renamed or have email changed locally',
+                ], 422);
+            }
+
+            if ((bool) ($payload['reset_temp_password'] ?? false)) {
+                return response()->json([
+                    'message' => 'Directory managed users can not receive local temporary passwords',
+                ], 422);
+            }
+        }
 
         $user->fill(array_filter([
             'first_name' => $payload['first_name'] ?? null,
@@ -504,9 +523,19 @@ class AdminUserController extends Controller
             'mfa_type' => $user->mfa_type,
             'mfa_app_setup_pending' => (bool) $user->mfa_app_setup_pending,
             'must_change_password' => (bool) $user->must_change_password,
+            'is_active' => (bool) $user->is_active,
+            'disabled_at' => optional($user->disabled_at)->toISOString(),
             'notification_sound_enabled' => (bool) $user->notification_sound_enabled,
             'notification_desktop_enabled' => (bool) $user->notification_desktop_enabled,
             'temp_password_expires_at' => optional($user->temp_password_expires_at)->toISOString(),
+            'auth_provider' => (string) ($user->auth_provider ?: 'local'),
+            'is_directory_user' => (string) $user->auth_provider === 'ad_ldap',
+            'can_edit_identity' => (string) $user->auth_provider !== 'ad_ldap',
+            'ad_username' => $user->ad_username,
+            'external_directory_id' => $user->external_directory_id,
+            'external_directory_dn' => $user->external_directory_dn,
+            'external_directory_active' => (bool) $user->external_directory_active,
+            'external_directory_last_sync_at' => optional($user->external_directory_last_sync_at)->toISOString(),
             'role_uuids' => $user->roles->pluck('uuid')->map(fn ($uuid): string => (string) $uuid)->values()->all(),
             'role_names' => $user->roles->pluck('name')->map(fn ($name): string => (string) $name)->values()->all(),
             'assigned_module_slugs' => $assignedModuleSlugs,

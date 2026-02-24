@@ -7,6 +7,7 @@ use App\Modules\ModuleLifecycleRunner;
 use App\Modules\ModuleRegistry;
 use App\Modules\ModuleStateStore;
 use App\Services\CoreLicenseSyncService;
+use App\Services\Auth\AdLdapService;
 use Database\Seeders\TenantE2ESeeder;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schedule;
@@ -70,6 +71,31 @@ Artisan::command('licenses:sync {--tenant_uuid=}', function (): int {
     );
 
     $this->info('licenses:sync ok tenant='.$tenantRef.' modules='.$sync['synced_count']);
+
+    return self::SUCCESS;
+});
+
+Artisan::command('directory:sync', function (AdLdapService $adLdapService): int {
+    $config = TenantSetting::query()->where('key', 'ad_ldap_config')->value('value_json');
+    if (!is_array($config)) {
+        $this->error('directory:sync failed: missing ad_ldap_config');
+        return self::FAILURE;
+    }
+
+    try {
+        $stats = $adLdapService->sync($config);
+    } catch (\Throwable $exception) {
+        $this->error('directory:sync failed: '.$exception->getMessage());
+        return self::FAILURE;
+    }
+
+    $this->info(sprintf(
+        'directory:sync ok total=%d created=%d updated=%d disabled=%d',
+        (int) ($stats['total'] ?? 0),
+        (int) ($stats['created'] ?? 0),
+        (int) ($stats['updated'] ?? 0),
+        (int) ($stats['disabled'] ?? 0)
+    ));
 
     return self::SUCCESS;
 });

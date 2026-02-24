@@ -14,7 +14,15 @@ class User extends Authenticatable
         'last_name',
         'uuid',
         'email',
+        'ad_username',
         'password',
+        'is_active',
+        'disabled_at',
+        'auth_provider',
+        'external_directory_id',
+        'external_directory_dn',
+        'external_directory_active',
+        'external_directory_last_sync_at',
         'mfa_type',
         'mfa_secret',
         'mfa_app_setup_pending',
@@ -31,9 +39,13 @@ class User extends Authenticatable
 
     protected $casts = [
         'must_change_password' => 'boolean',
+        'is_active' => 'boolean',
+        'disabled_at' => 'datetime',
         'mfa_app_setup_pending' => 'boolean',
         'notification_sound_enabled' => 'boolean',
         'notification_desktop_enabled' => 'boolean',
+        'external_directory_active' => 'boolean',
+        'external_directory_last_sync_at' => 'datetime',
         'temp_password_expires_at' => 'datetime',
     ];
 

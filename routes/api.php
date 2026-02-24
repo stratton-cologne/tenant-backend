@@ -57,6 +57,11 @@ Route::prefix('tenant')->group(function (): void {
         Route::get('/settings/general', [SettingsController::class, 'getGeneral'])->middleware('permission:settings.manage');
         Route::patch('/settings/general', [SettingsController::class, 'updateGeneral'])->middleware('permission:settings.manage');
         Route::post('/settings/mail/test', [SettingsController::class, 'sendTestMail'])->middleware('permission:settings.manage');
+        Route::post('/settings/auth/ldap/test', [SettingsController::class, 'testLdap'])->middleware('permission:settings.manage');
+        Route::post('/settings/auth/ldap/sync', [SettingsController::class, 'syncLdap'])->middleware('permission:settings.manage');
+        Route::get('/settings/auth/ldap/users', [SettingsController::class, 'ldapUsers'])->middleware('permission:settings.manage');
+        Route::post('/settings/auth/ldap/deactivate', [SettingsController::class, 'deactivateLdap'])->middleware('permission:settings.manage');
+        Route::get('/settings/auth/ldap/deactivate/{operationId}', [SettingsController::class, 'ldapDeactivationStatus'])->middleware('permission:settings.manage');
         Route::get('/settings/licenses', [SettingsController::class, 'getLicenses'])->middleware('permission:settings.licenses.read');
         Route::post('/settings/licenses/sync', [SettingsController::class, 'syncLicenses'])->middleware('permission:settings.licenses.sync');
         Route::post('/settings/licenses/activate', [SettingsController::class, 'activateLicense'])->middleware('permission:settings.licenses.sync');
