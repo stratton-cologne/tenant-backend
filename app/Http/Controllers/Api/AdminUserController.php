@@ -33,7 +33,6 @@ class AdminUserController extends Controller
     public function index(): JsonResponse
     {
         $users = User::query()
-            ->where('is_active', true)
             ->with(['roles', 'moduleEntitlements'])
             ->latest('created_at')
             ->get()
@@ -56,7 +55,7 @@ class AdminUserController extends Controller
         ]);
 
         $validDays = (int) ($payload['temp_password_valid_days'] ?? 7);
-        $tempPassword = Str::password(14);
+        $tempPassword = Str::password(14, true, true, false, false);
 
         $user = User::query()->create([
             'first_name' => $payload['first_name'],
@@ -124,6 +123,7 @@ class AdminUserController extends Controller
     public function update(Request $request, User $user): JsonResponse
     {
         $beforeRoleNames = $user->roles()->pluck('name')->map(fn (mixed $name): string => (string) $name)->all();
+        $beforeIsActive = (bool) $user->is_active;
         $isDirectoryUser = (string) $user->auth_provider === 'ad_ldap';
 
         $payload = $request->validate([
@@ -131,6 +131,7 @@ class AdminUserController extends Controller
             'last_name' => ['sometimes', 'string', 'max:120'],
             'email' => ['sometimes', 'email:rfc', 'max:255', 'unique:users,email,'.$user->uuid.',uuid'],
             'mfa_type' => ['sometimes', 'in:mail,app'],
+            'is_active' => ['sometimes', 'boolean'],
             'reset_temp_password' => ['nullable', 'boolean'],
             'temp_password_valid_days' => ['nullable', 'integer', 'in:1,3,7'],
             'role_uuids' => ['sometimes', 'array'],
@@ -161,7 +162,29 @@ class AdminUserController extends Controller
             'last_name' => $payload['last_name'] ?? null,
             'email' => isset($payload['email']) ? Str::lower($payload['email']) : null,
             'mfa_type' => $payload['mfa_type'] ?? null,
+            'is_active' => array_key_exists('is_active', $payload) ? (bool) $payload['is_active'] : null,
         ], fn ($value) => $value !== null))->save();
+
+        if (array_key_exists('is_active', $payload)) {
+            $isActive = (bool) $payload['is_active'];
+            $user->disabled_at = $isActive ? null : now();
+            $user->save();
+
+            if ($beforeIsActive !== $isActive) {
+                $this->tenantNotificationService->notifyUserUuid(
+                    (string) $user->uuid,
+                    $isActive ? 'account.activated' : 'account.deactivated',
+                    $isActive ? 'Konto aktiviert' : 'Konto deaktiviert',
+                    $isActive
+                        ? 'Dein Benutzerkonto wurde durch einen Administrator aktiviert.'
+                        : 'Dein Benutzerkonto wurde durch einen Administrator deaktiviert.',
+                    [
+                        'is_active' => $isActive,
+                        'updated_by' => (string) $request->attributes->get('auth.user_uuid'),
+                    ]
+                );
+            }
+        }
 
         if (array_key_exists('role_uuids', $payload)) {
             $user->roles()->sync(Role::query()->whereIn('uuid', $payload['role_uuids'])->pluck('id')->all());
@@ -206,7 +229,7 @@ class AdminUserController extends Controller
 
         if ((bool) ($payload['reset_temp_password'] ?? false)) {
             $validDays = (int) ($payload['temp_password_valid_days'] ?? 7);
-            $tempPassword = Str::password(14);
+            $tempPassword = Str::password(14, true, true, false, false);
             $user->password = Hash::make($tempPassword);
             $user->mfa_type = 'mail';
             $user->mfa_secret = null;

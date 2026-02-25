@@ -74,7 +74,7 @@ class ProcessLdapDeactivationJob implements ShouldQueue
             $convertedMailPayloads = [];
             DB::transaction(function () use ($convertUsers, $disableUsers, &$convertedMailPayloads): void {
                 foreach ($convertUsers as $user) {
-                    $tempPassword = Str::password(14);
+                    $tempPassword = Str::password(14, true, true, false, false);
                     $expiresAt = now()->addDays($this->tempPasswordValidDays);
                     $user->password = Hash::make($tempPassword);
                     $user->auth_provider = 'local';
@@ -205,4 +205,3 @@ class ProcessLdapDeactivationJob implements ShouldQueue
         );
     }
 }
-

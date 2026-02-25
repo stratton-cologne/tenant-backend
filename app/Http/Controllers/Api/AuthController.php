@@ -49,10 +49,18 @@ class AuthController extends Controller
             ], 429);
         }
 
-        $user = $this->authenticateUser((string) $payload['email'], (string) $payload['password']);
+        $authResult = $this->authenticateUser((string) $payload['email'], (string) $payload['password']);
+        $user = $authResult['user'];
         if ($user === null) {
             RateLimiter::hit($rateLimitKey, 60);
             $this->audit(null, 'auth.login.failed', ['email' => $payload['email']]);
+
+            if (($authResult['reason'] ?? null) === 'account_deactivated') {
+                return response()->json(['message' => 'Account is deactivated'], 422);
+            }
+            if (($authResult['reason'] ?? null) === 'local_login_disabled') {
+                return response()->json(['message' => 'Local login is disabled for this tenant'], 422);
+            }
 
             return response()->json(['message' => 'Invalid credentials'], 422);
         }
@@ -291,8 +299,16 @@ class AuthController extends Controller
         ]);
     }
 
-    private function authenticateUser(string $email, string $password): ?User
+    /**
+     * @return array{user: User|null, reason: string|null}
+     */
+    private function authenticateUser(string $email, string $password): array
     {
+        $normalizedEmail = Str::lower($email);
+        $localUser = User::query()
+            ->where('email', $normalizedEmail)
+            ->first();
+
         $provider = $this->authProvider();
         $allowLocalFallback = $this->authAllowLocalFallback();
 
@@ -305,23 +321,44 @@ class AuthController extends Controller
             }
 
             if (is_array($adUser)) {
-                return $this->upsertAdUser($adUser);
+                return [
+                    'user' => $this->upsertAdUser($adUser),
+                    'reason' => null,
+                ];
             }
 
             if (!$allowLocalFallback) {
-                return null;
+                if ($localUser !== null) {
+                    return [
+                        'user' => null,
+                        'reason' => 'local_login_disabled',
+                    ];
+                }
+                return [
+                    'user' => null,
+                    'reason' => null,
+                ];
             }
         }
 
-        $user = User::query()
-            ->where('email', Str::lower($email))
-            ->where('is_active', true)
-            ->first();
-        if ($user === null || !Hash::check($password, (string) $user->password)) {
-            return null;
+        if ($localUser !== null && !(bool) $localUser->is_active) {
+            return [
+                'user' => null,
+                'reason' => 'account_deactivated',
+            ];
         }
 
-        return $user;
+        if ($localUser === null || !Hash::check($password, (string) $localUser->password)) {
+            return [
+                'user' => null,
+                'reason' => null,
+            ];
+        }
+
+        return [
+            'user' => $localUser,
+            'reason' => null,
+        ];
     }
 
     /**
