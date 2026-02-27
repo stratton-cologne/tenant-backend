@@ -19,9 +19,15 @@ class TenantModuleServiceProvider extends ServiceProvider
 
     public function boot(ModuleRegistry $moduleRegistry): void
     {
+        $this->registerModuleAutoload($moduleRegistry);
+
         $migrationPaths = $moduleRegistry->collectTenantMigrationPaths();
         if ($migrationPaths !== []) {
             $this->loadMigrationsFrom($migrationPaths);
+        }
+
+        foreach ($moduleRegistry->collectViewPathsByNamespace() as $namespace => $paths) {
+            $this->loadViewsFrom($paths, $namespace);
         }
 
         if ($this->app->routesAreCached()) {
@@ -31,5 +37,33 @@ class TenantModuleServiceProvider extends ServiceProvider
         foreach ($moduleRegistry->collectApiRouteFiles() as $apiRouteFile) {
             Route::prefix('api')->middleware('api')->group($apiRouteFile);
         }
+    }
+
+    private function registerModuleAutoload(ModuleRegistry $moduleRegistry): void
+    {
+        $mappings = $moduleRegistry->collectPsr4AutoloadMappings();
+        if ($mappings === []) {
+            return;
+        }
+
+        spl_autoload_register(static function (string $class) use ($mappings): void {
+            foreach ($mappings as $mapping) {
+                $prefix = $mapping['prefix'];
+                if (!str_starts_with($class, $prefix)) {
+                    continue;
+                }
+
+                $relative = substr($class, strlen($prefix));
+                if ($relative === false) {
+                    continue;
+                }
+
+                $relativePath = str_replace('\\', DIRECTORY_SEPARATOR, $relative).'.php';
+                $file = rtrim($mapping['path'], DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR.$relativePath;
+                if (is_file($file)) {
+                    require_once $file;
+                }
+            }
+        });
     }
 }

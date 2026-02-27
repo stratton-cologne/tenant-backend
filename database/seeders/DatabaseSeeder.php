@@ -3,6 +3,7 @@
 namespace Database\Seeders;
 
 use Illuminate\Database\Seeder;
+use Modules\ItEquipment\Tenant\Database\Seeders\ItEquipmentModuleSeeder;
 
 class DatabaseSeeder extends Seeder
 {
@@ -11,6 +12,7 @@ class DatabaseSeeder extends Seeder
         $this->call([
             TenantE2ESeeder::class,
             TicketModuleSeeder::class,
+            ItEquipmentModuleSeeder::class,
         ]);
     }
 }

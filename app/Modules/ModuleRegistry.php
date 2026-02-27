@@ -22,9 +22,13 @@ class ModuleRegistry
      *     file:string,
      *     class:string
      *   },
+     *   autoload:array{
+     *     psr_4:array<string, string>
+     *   },
      *   tenant_backend:array{
      *     routes:array{api:array<int, string>},
-     *     migrations:array<int, string>
+     *     migrations:array<int, string>,
+     *     views:array<int, string>
      *   }
      * }>
      */
@@ -68,9 +72,13 @@ class ModuleRegistry
      *     file:string,
      *     class:string
      *   },
+     *   autoload:array{
+     *     psr_4:array<string, string>
+     *   },
      *   tenant_backend:array{
      *     routes:array{api:array<int, string>},
-     *     migrations:array<int, string>
+     *     migrations:array<int, string>,
+     *     views:array<int, string>
      *   }
      * }|null
      */
@@ -117,6 +125,54 @@ class ModuleRegistry
         return array_values(array_unique($paths));
     }
 
+    /**
+     * @return array<int, array{prefix:string, path:string}>
+     */
+    public function collectPsr4AutoloadMappings(?string $slug = null): array
+    {
+        $modules = $slug === null ? $this->discover() : array_filter([$this->find($slug)]);
+        $mappings = [];
+
+        foreach ($modules as $module) {
+            foreach ($module['autoload']['psr_4'] as $prefix => $path) {
+                if ($prefix === '' || !is_dir($path)) {
+                    continue;
+                }
+
+                $mappings[] = [
+                    'prefix' => $prefix,
+                    'path' => $path,
+                ];
+            }
+        }
+
+        return $mappings;
+    }
+
+    /**
+     * @return array<string, array<int, string>>
+     */
+    public function collectViewPathsByNamespace(?string $slug = null): array
+    {
+        $modules = $slug === null ? $this->discover() : array_filter([$this->find($slug)]);
+        $result = [];
+
+        foreach ($modules as $module) {
+            $paths = [];
+            foreach ($module['tenant_backend']['views'] as $viewPath) {
+                if (is_dir($viewPath)) {
+                    $paths[] = $viewPath;
+                }
+            }
+
+            if ($paths !== []) {
+                $result[$module['slug']] = array_values(array_unique($paths));
+            }
+        }
+
+        return $result;
+    }
+
     private function resolveBasePath(): string
     {
         return $this->modulesBasePath !== null
@@ -137,9 +193,13 @@ class ModuleRegistry
      *     file:string,
      *     class:string
      *   },
+     *   autoload:array{
+     *     psr_4:array<string, string>
+     *   },
      *   tenant_backend:array{
      *     routes:array{api:array<int, string>},
-     *     migrations:array<int, string>
+     *     migrations:array<int, string>,
+     *     views:array<int, string>
      *   }
      * }
      */
@@ -152,6 +212,8 @@ class ModuleRegistry
         $lifecycleRaw = (array) ($manifestRaw['lifecycle'] ?? []);
         $lifecycleFile = $this->toAbsolutePath($moduleDir, (string) ($lifecycleRaw['file'] ?? ''));
         $lifecycleClass = trim((string) ($lifecycleRaw['class'] ?? ''));
+        $autoloadRaw = (array) ($manifestRaw['autoload'] ?? []);
+        $psr4Raw = (array) ($autoloadRaw['psr-4'] ?? []);
 
         $permissions = array_values(array_filter(
             array_map(static fn (mixed $permission): string => trim((string) $permission), (array) ($manifestRaw['permissions'] ?? [])),
@@ -169,6 +231,20 @@ class ModuleRegistry
             array_map(fn (mixed $path): string => $this->toAbsolutePath($moduleDir, (string) $path), (array) ($tenantBackend['migrations'] ?? [])),
             static fn (string $path): bool => $path !== ''
         ));
+        $views = array_values(array_filter(
+            array_map(fn (mixed $path): string => $this->toAbsolutePath($moduleDir, (string) $path), (array) ($tenantBackend['views'] ?? [])),
+            static fn (string $path): bool => $path !== ''
+        ));
+        $psr4 = [];
+        foreach ($psr4Raw as $prefix => $path) {
+            $prefix = trim((string) $prefix);
+            $absolutePath = $this->toAbsolutePath($moduleDir, (string) $path);
+            if ($prefix === '' || $absolutePath === '') {
+                continue;
+            }
+
+            $psr4[$prefix] = $absolutePath;
+        }
 
         return [
             'slug' => $slug,
@@ -181,9 +257,13 @@ class ModuleRegistry
                 'file' => $lifecycleFile,
                 'class' => $lifecycleClass,
             ],
+            'autoload' => [
+                'psr_4' => $psr4,
+            ],
             'tenant_backend' => [
                 'routes' => ['api' => $apiRoutes],
                 'migrations' => $migrations,
+                'views' => $views,
             ],
         ];
     }

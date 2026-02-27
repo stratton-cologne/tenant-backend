@@ -50,11 +50,14 @@ storage/framework/cache/*
 storage/framework/sessions/*
 storage/framework/views/*
 storage/logs/*
+/storage/app/private/*
+storage/app/private/*
 /storage/logs/*.log
 **/storage/framework/cache/*
 **/storage/framework/sessions/*
 **/storage/framework/views/*
 **/storage/logs/*
+**/storage/app/private/*
 bootstrap/cache/*.php
 **/bootstrap/cache/*.php
 
