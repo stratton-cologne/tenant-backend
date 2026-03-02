@@ -62,6 +62,11 @@ bootstrap/cache/*.php
 **/bootstrap/cache/*.php
 
 ############################################################
+# Tenant Module und Build-Artefakte
+modules/*
+!modules/README.md
+
+############################################################
 # Node Module und Build-Artefakte
 coverage/
 playwright-report/
