@@ -7,6 +7,7 @@ use App\Models\Permission;
 use App\Models\Role;
 use App\Models\TenantSetting;
 use App\Models\User;
+use App\Models\UserModuleEntitlement;
 use App\Services\Auth\JwtService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Hash;
@@ -35,7 +36,7 @@ class TicketsCrudTest extends TestCase
 
         $create->assertCreated();
         $ticketUuid = (string) $create->json('data.uuid');
-        $ticketNo = (string) $create->json('data.ticket_no');
+        $ticketNo = (string) $create->json('data.number');
         $this->assertNotSame('', $ticketUuid);
         $this->assertNotSame('', $ticketNo);
 
@@ -47,6 +48,8 @@ class TicketsCrudTest extends TestCase
         $update = $this->withHeaders(['Authorization' => 'Bearer '.$token])
             ->patchJson('/api/tenant/tickets/'.$ticketUuid, [
                 'title' => 'Cannot open billing invoice (updated)',
+                'description' => 'Invoice download throws 500',
+                'priority' => 'high',
             ]);
         $update->assertOk();
         $update->assertJsonPath('data.title', 'Cannot open billing invoice (updated)');
@@ -54,7 +57,7 @@ class TicketsCrudTest extends TestCase
         $delete = $this->withHeaders(['Authorization' => 'Bearer '.$token])
             ->deleteJson('/api/tenant/tickets/'.$ticketUuid);
         $delete->assertOk();
-        $delete->assertJsonPath('status', 'ok');
+        $delete->assertJsonPath('deleted', true);
     }
 
     /**
@@ -83,6 +86,10 @@ class TicketsCrudTest extends TestCase
             ->all();
         $role->permissions()->sync($permissionIds);
         $user->roles()->sync([$role->id]);
+        UserModuleEntitlement::query()->updateOrCreate(
+            ['user_uuid' => (string) $user->uuid, 'module_slug' => 'tickets'],
+            ['assigned_by_uuid' => (string) $user->uuid]
+        );
 
         return app(JwtService::class)->issue([
             'sub' => (string) $user->uuid,

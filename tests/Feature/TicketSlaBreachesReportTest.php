@@ -6,12 +6,13 @@ use App\Models\ModuleEntitlement;
 use App\Models\Permission;
 use App\Models\Role;
 use App\Models\TenantSetting;
-use App\Models\Tickets\Ticket;
-use App\Models\Tickets\TicketSlaPolicy;
 use App\Models\User;
+use App\Models\UserModuleEntitlement;
 use App\Services\Auth\JwtService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Str;
 use Tests\TestCase;
 
 class TicketSlaBreachesReportTest extends TestCase
@@ -23,30 +24,26 @@ class TicketSlaBreachesReportTest extends TestCase
         $tenantId = '44444444-4444-4444-8444-444444444444';
         $token = $this->issueTokenWithPermissions(['tickets.report.read'], $tenantId);
 
-        TicketSlaPolicy::query()->updateOrCreate(
-            ['tenant_id' => $tenantId, 'priority' => 'low'],
-            ['first_response_minutes' => 1, 'resolve_minutes' => 1, 'is_active' => true]
-        );
-
-        $ticket = Ticket::query()->create([
+        DB::table('tickets')->insert([
             'tenant_id' => $tenantId,
-            'ticket_no' => 'TKT-910001',
+            'uuid' => (string) Str::uuid(),
+            'number' => 'TKT-2026-0009',
             'title' => 'SLA breach candidate',
             'description' => 'Created long ago and still open',
             'status' => 'in_progress',
             'priority' => 'low',
+            'resolution_due_at' => now()->subHour(),
+            'created_at' => now()->subHours(3),
+            'updated_at' => now()->subHours(3),
         ]);
-        $ticket->created_at = now()->subHours(3);
-        $ticket->updated_at = now()->subHours(3);
-        $ticket->saveQuietly();
 
         $response = $this->withHeaders(['Authorization' => 'Bearer '.$token])
-            ->getJson('/api/tenant/tickets/reports/sla-breaches');
+            ->getJson('/api/tenant/tickets/reports/summary');
 
         $response->assertOk();
-        $response->assertJsonPath('data.0.ticket_no', 'TKT-910001');
-        $response->assertJsonPath('data.0.first_response_breached', true);
-        $response->assertJsonPath('data.0.resolve_breached', true);
+        $response->assertJsonPath('total', 1);
+        $response->assertJsonPath('in_progress', 1);
+        $response->assertJsonPath('sla_breaches', 1);
     }
 
     /**
@@ -75,6 +72,10 @@ class TicketSlaBreachesReportTest extends TestCase
             ->all();
         $role->permissions()->sync($permissionIds);
         $user->roles()->sync([$role->id]);
+        UserModuleEntitlement::query()->updateOrCreate(
+            ['user_uuid' => (string) $user->uuid, 'module_slug' => 'tickets'],
+            ['assigned_by_uuid' => (string) $user->uuid]
+        );
 
         return app(JwtService::class)->issue([
             'sub' => (string) $user->uuid,
